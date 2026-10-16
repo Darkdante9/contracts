@@ -72,8 +72,6 @@ pub enum Error {
     InvalidDuration = 4,
     /// `init` has not been called, so no admin is configured.
     NotInitialised = 5,
-    /// Reserved; kept so existing error codes stay stable.
-    UpgradeNotAllowed = 6,
     /// `init` has already been called; the admin cannot be overwritten.
     AlreadyInitialised = 7,
     /// The lease has already expired; there is nothing to revoke.
@@ -217,16 +215,5 @@ impl AccessLease {
     ///
     /// # Parameters
     /// * `resource_id` — identifier of the resource being leased. Must be
-    ///   non-empty and at most [`MAX_RESOURCE_ID_LEN`] bytes.
-    /// * `buyer` — wallet receiving access.
-    /// * `duration_ledgers` — lease length in ledgers; must be non-zero.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — `init` has not been called.
-    /// * [`Error::InvalidResourceId`] — `resource_id` is empty or longer than
-    ///   [`MAX_RESOURCE_ID_LEN`] bytes.
-    /// * [`Error::InvalidDuration`] — `duration_ledgers == 0`, or the expiry
-    ///   would overflow `u32`.
-    /// * [`Error::AlreadyActive`
 
-/* … truncated 6186 chars — edit only what you need near the top … */
+/* … truncated 609 chars — edit only what you need near the top … */

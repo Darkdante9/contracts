@@ -194,8 +194,9 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `NotAdmin` | Reserved. |
+| 1 | `NotAdmin` | Reserved. Never returned: admin-gated entrypoints call `admin.require_auth()`, so a failed authorisation traps (panics) instead of returning this code. |
 | 2 | `LeaseNotFound` | No lease for the pair. |
+| 3 | `AlreadyActive` | 
 | 3 | `AlreadyActive` | A non-expired lease already exists for the pair. |
 | 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. |
 | 5 | `NotInitialised` | Admin-only call before `init`. |

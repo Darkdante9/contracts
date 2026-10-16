@@ -25,6 +25,7 @@ storage or error codes must update this file in the same pull request.
 | Versioning | `get_version()` returns the version recorded at `init` (crate version); `is_compatible(...)` detects stale deployments. |
 | Errors | Every fallible entrypoint returns `Result<_, Error>`; codes are stable and never renumbered. |
 | Events | Defined as `#[contractevent]` types (so they appear in the contract spec and generated bindings). Topics start with a fixed symbol; data is a single value. Unit tests (`events_have_documented_shape`) pin the wire format. |
+| Cross-contract calls | Contracts in this workspace are **independent**: none of them performs a cross-contract call to another SynapsVault contract. Each contract validates only its own inputs and trusts the admin/backend to supply consistent identifiers. See [Cross-contract trust model](#cross-contract-trust-model). |
 
 ### Roles
 
@@ -36,6 +37,31 @@ storage or error codes must update this file in the same pull request.
 | **Buyer / Subscriber** | Holds leases/subscriptions; a subscriber can cancel their own subscription. |
 | **Anyone** | All read-only entrypoints (`get`, `list`, `is_valid`, `is_active`, …) are permissionless. |
 
+### Cross-contract trust model
+
+SynapsVault contracts are deployed and operated as a set but are **not wired
+together on-chain**. In particular, `access-lease` does **not** call
+`vault-registry` to verify that a `resource_id` exists before granting a lease.
+
+This is a deliberate decision, not an oversight:
+
+- **Trusted admin.** `grant_lease` / `extend_lease` are admin-only. The admin is
+  the backend platform wallet, which is the same actor that registers resources
+  in `vault-registry`. It is expected to only grant leases for resources it has
+  registered.
+- **No coupling / no upgrade hazard.** A cross-contract call would hard-code the
+  `vault-registry` contract id into `access-lease`, coupling their deployments
+  and upgrade paths, and would add a re-entrancy / failure surface for a check
+  that the trusted caller already guarantees.
+- **Cheap off-chain verification.** Any party can independently confirm a
+  resource exists via the permissionless `vault-registry::exists(id)` read, so
+  the invariant is verifiable without an on-chain check.
+
+Consequence: a lease may reference a `resource_id` that is not (or no longer)
+registered. Consumers should treat `access-lease` as the authority on *lease*
+existence and `vault-registry` as the authority on *resource* existence, and
+check both when both matter.
+
 ---
 
 ## vault-registry
@@ -43,7 +69,7 @@ storage or error codes must update this file in the same pull request.
 On-chain registry of vault resources: creator, price, metadata pointer, tags
 and listing status. Payment itself happens off-contract (x402 + USDC SAC); the
 registry is the transparent source of truth for *what* exists, *who* owns it
-and *what it costs*.
+and *what* it costs.
 
 ### Data
 
@@ -167,6 +193,8 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 
 - `grant_lease` rejects a zero duration and any duration whose expiry would
   overflow `u32`. An expired lease may be replaced by a new grant.
+- `grant_lease` does **not** verify that `resource_id` exists in
+  `vault-registry`; see [Cross-contract trust model](#cross-contract-trust-model).
 - `extend_lease` computes `max(expires_at, now) + extra_ledgers`, so an expired
   lease restarts from the current ledger. Zero / overflowing extensions are rejected.
 - `revoke_lease` deletes the record.
@@ -196,120 +224,7 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 |---|---|---|
 | 1 | `NotAdmin` | Reserved. |
 | 2 | `LeaseNotFound` | No lease for the pair. |
-| 3 | `AlreadyActive` | An unexpired lease already exists. |
-| 4 | `InvalidDuration` | Zero duration, or expiry would overflow. |
+| 3 | `AlreadyActive` | A non-expired lease already exists for the pair. |
+| 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. |
 | 5 | `NotInitialised` | Admin-only call before `init`. |
-| 6 | `UpgradeNotAllowed` | Reserved. |
-| 7 | `AlreadyInitialised` | `init` called twice. |
-
----
-
-## subscription
-
-Recurring 30-day subscription plans. Publishers define plans; the backend
-subscribes buyers after payment and renews each cycle. Subscribers can
-self-cancel and keep access through the end of the paid period.
-
-### Data
-
-```rust
-pub struct Plan {
-    pub plan_id: String,
-    pub publisher: Address,
-    pub price_per_cycle: i128, // USDC stroops, > 0
-    pub active: bool,          // false => no new subscriptions
-}
-
-pub struct Subscription {
-    pub plan_id: String,
-    pub subscriber: Address,
-    pub started_at: u32,
-    pub current_period_end: u32,
-    pub cancelled: bool,       // blocks renewals; access runs to period end
-    pub total_renewals: u32,
-}
-```
-
-`CYCLE` = 30 days = 518,400 ledgers. A subscription is **active** iff it exists
-and `current_period_end > ledger.sequence()` — this includes cancelled
-subscriptions whose paid period has not yet ended.
-
-### Functions
-
-| Function | Auth | Returns | Errors |
-|---|---|---|---|
-| `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
-| `admin()` | — | `Address` | `NotInitialised` |
-| `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
-| `create_plan(publisher, plan_id, price_per_cycle)` | `publisher` | `Plan` | `InvalidPrice`, `PlanExists` |
-| `get_plan(plan_id)` | — | `Plan` | `PlanNotFound` |
-| `deactivate_plan(plan_id)` | Publisher | `()` | `PlanNotFound` |
-| `subscribe(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `PlanNotFound`, `PlanInactive`, `AlreadySubbed`, `Overflow` |
-| `renew(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `SubNotFound`, `Cancelled`, `Overflow` |
-| `cancel(plan_id, subscriber)` | `subscriber` | `()` (idempotent) | `SubNotFound` |
-| `is_active(plan_id, subscriber)` | — | `bool` | — |
-| `get_subscription(plan_id, subscriber)` | — | `Subscription` | `SubNotFound` |
-| `get_version()` | — | `String` | — |
-| `is_compatible()` | — | `bool` | — |
-| `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
-
-**Semantics**
-
-- `subscribe` is rejected while a non-cancelled subscription is still in its
-  paid period. Re-subscribing after a cancel carries over any remaining paid
-  time (`max(current_period_end, now) + CYCLE`).
-- `renew` stacks from `max(current_period_end, now)`, and keeps working after
-  the plan is deactivated.
-- Plan ids are first-come-first-served; an existing plan can never be overwritten.
-
-### Storage
-
-| Key | Storage | Value | TTL |
-|---|---|---|---|
-| `Admin` | instance | `Address` | instance bumped to 1 year on admin calls |
-| `Version` | instance | `String` | — |
-| `Plan(plan_id)` | persistent | `Plan` | bumped to 1 year on write |
-| `Sub(plan_id, subscriber)` | persistent | `Subscription` | bumped to 1 year on write |
-
-### Events
-
-| Topics | Data |
-|---|---|
-| `("init",)` | admin |
-| `("setadmin",)` | new admin |
-| `("plan", plan_id, publisher)` | price per cycle |
-| `("deactiv", plan_id)` | `()` |
-| `("subscribe", plan_id, subscriber)` | `current_period_end` |
-| `("renew", plan_id, subscriber)` | new `current_period_end` |
-| `("cancel", plan_id, subscriber)` | `()` |
-| `("upgrade",)` | new wasm hash |
-
-### Errors
-
-| Code | Name | Meaning |
-|---|---|---|
-| 1 | `NotAdmin` | Reserved. |
-| 2 | `PlanNotFound` | No plan with `plan_id`. |
-| 3 | `PlanInactive` | Plan deactivated; no new subscriptions. |
-| 4 | `AlreadySubbed` | Active, non-cancelled subscription exists. |
-| 5 | `SubNotFound` | No subscription for the pair. |
-| 6 | `Cancelled` | Cannot renew a cancelled subscription. |
-| 7 | `InvalidPrice` | Price ≤ 0. |
-| 8 | `NotInitialised` | Admin-only call before `init`. |
-| 9 | `AlreadyInitialised` | `init` called twice. |
-| 10 | `PlanExists` | `plan_id` already taken. |
-| 11 | `Overflow` | Period end would overflow `u32`. |
-
----
-
-## Example (Rust test client)
-
-```rust
-let env = Env::default();
-env.mock_all_auths();
-
-let lease = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
-lease.init(&admin);
-lease.grant_lease(&String::from_str(&env, "res_1"), &buyer, &17_280); // 1 day
-assert!(lease.is_valid(&String::from_str(&env, "res_1"), &buyer));
-```
+| 6 | `AlreadyInitialised` | `init` called twice. |

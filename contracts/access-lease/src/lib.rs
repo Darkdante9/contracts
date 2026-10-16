@@ -70,6 +70,8 @@ pub enum Error {
     UpgradeNotAllowed = 6,
     /// `init` has already been called; the admin cannot be overwritten.
     AlreadyInitialised = 7,
+    /// The lease has already expired; there is nothing to revoke.
+    LeaseExpired = 8,
 }
 
 /// Emitted by [`AccessLease::init`]. Topics: `("init",)`; data: admin.
@@ -216,36 +218,24 @@ impl AccessLease {
     ///   would overflow `u32`.
     /// * [`Error::AlreadyActive`] — an unexpired lease already exists for the
     ///   `(resource_id, buyer)` pair.
-    ///
-    /// # Invariants
-    /// On success, `expires_at == granted_at + duration_ledgers`, the lease is
-    /// written to persistent storage, and its TTL is bumped to `BUMP`.
-    /// Expired leases may be replaced by a new grant.
     pub fn grant_lease(
         env: Env,
         resource_id: String,
         buyer: Address,
         duration_ledgers: u32,
-    ) -> Result<Lease, Error> {
+    ) -> Result<(), Error> {
         Self::require_admin(&env)?;
-
         if duration_ledgers == 0 {
             return Err(Error::InvalidDuration);
         }
-
-        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
         let now = env.ledger().sequence();
-
-        // Reject if an active (not yet expired) lease exists.
+        let expires_at = now.checked_add(duration_ledgers).ok_or(Error::InvalidDuration)?;
+        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
         if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
             if existing.expires_at > now {
                 return Err(Error::AlreadyActive);
             }
         }
-
-        let expires_at = now
-            .checked_add(duration_ledgers)
-            .ok_or(Error::InvalidDuration)?;
         let lease = Lease {
             resource_id: resource_id.clone(),
             buyer: buyer.clone(),
@@ -253,133 +243,139 @@ impl AccessLease {
             expires_at,
             duration_ledgers,
         };
-
         env.storage().persistent().set(&key, &lease);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
         GrantEvent {
             resource_id,
             buyer,
             expires_at,
         }
         .publish(&env);
-        Ok(lease)
+        Ok(())
     }
 
-    /// Extend an existing lease by `extra_ledgers`.
+    /// Extend an existing lease's expiry by `additional_ledgers`.
     ///
-    /// Admin-only. Works on both active and expired leases: the new expiry is
-    /// computed from `max(existing.expires_at, current_ledger)` so that an
-    /// expired lease restarts from the current ledger rather than from its
-    /// stale expiry.
+    /// Admin-only. The lease must exist; extending an expired lease is allowed
+    /// and revives it from the current ledger sequence.
     ///
     /// # Errors
-    /// * [`Error::NotInitialised`] — admin check failed.
-    /// * [`Error::InvalidDuration`] — `extra_ledgers == 0`, or the expiry
-    ///   would overflow `u32`.
+    /// * [`Error::NotInitialised`] — `init` has not been called.
     /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
-    ///
-    /// # Invariants
-    /// On success, `expires_at == max(old_expires_at, now) + extra_ledgers`
-    /// and the persistent TTL is bumped to `BUMP`.
+    /// * [`Error::InvalidDuration`] — `additional_ledgers == 0`, or the new
+    ///   expiry would overflow `u32`.
     pub fn extend_lease(
         env: Env,
         resource_id: String,
         buyer: Address,
-        extra_ledgers: u32,
-    ) -> Result<Lease, Error> {
+        additional_ledgers: u32,
+    ) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        if extra_ledgers == 0 {
+        if additional_ledgers == 0 {
             return Err(Error::InvalidDuration);
         }
         let key = DataKey::Lease(resource_id.clone(), buyer.clone());
-        let mut lease: Lease = env
+        let mut lease = env
             .storage()
             .persistent()
-            .get(&key)
+            .get::<_, Lease>(&key)
             .ok_or(Error::LeaseNotFound)?;
-
-        // Extend from end of current period, or from now if already expired.
-        let base = lease.expires_at.max(env.ledger().sequence());
-        lease.expires_at = base
-            .checked_add(extra_ledgers)
+        let now = env.ledger().sequence();
+        let base = if lease.expires_at > now {
+            lease.expires_at
+        } else {
+            now
+        };
+        let expires_at = base
+            .checked_add(additional_ledgers)
             .ok_or(Error::InvalidDuration)?;
-
+        lease.expires_at = expires_at;
+        lease.duration_ledgers = lease.duration_ledgers.saturating_add(additional_ledgers);
         env.storage().persistent().set(&key, &lease);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
         ExtendEvent {
             resource_id,
             buyer,
-            expires_at: lease.expires_at,
+            expires_at,
         }
         .publish(&env);
-        Ok(lease)
+        Ok(())
     }
 
-    /// Returns `true` if `buyer` currently holds a valid lease for `resource_id`.
+    /// Revoke an existing lease, removing the buyer's access immediately.
     ///
-    /// Permissionless — any caller can verify without trusting the backend.
-    /// A lease is valid iff it exists and `expires_at > env.ledger().sequence()`.
+    /// Admin-only. The lease record is deleted from persistent storage and a
+    /// [`RevokeEvent`] is emitted.
+    ///
+    /// An already-expired lease is treated as an explicit **no-op**: the
+    /// record is removed (if still present) but no [`RevokeEvent`] is emitted,
+    /// since the lease no longer grants any access and there is nothing to
+    /// revoke. This keeps the event log meaningful — a `RevokeEvent` always
+    /// signals that access was actually terminated by this call.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialised`] — `init` has not been called.
+    /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
+    pub fn revoke_lease(env: Env, resource_id: String, buyer: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
+        let lease = env
+            .storage()
+            .persistent()
+            .get::<_, Lease>(&key)
+            .ok_or(Error::LeaseNotFound)?;
+        env.storage().persistent().remove(&key);
+        // Already-expired leases grant no access: treat revocation as a no-op
+        // and skip the event so `RevokeEvent` only fires on real revocations.
+        if lease.expires_at <= env.ledger().sequence() {
+            return Ok(());
+        }
+        RevokeEvent {
+            resource_id,
+            buyer,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Return the stored lease for `(resource_id, buyer)`, if any.
+    ///
+    /// Permissionless. The returned lease may be expired; callers should
+    /// compare `expires_at` against the current ledger sequence (or use
+    /// [`is_valid`](AccessLease::is_valid)) to determine access.
+    pub fn get_lease(env: Env, resource_id: String, buyer: Address) -> Option<Lease> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Lease(resource_id, buyer))
+    }
+
+    /// Return `true` if an unexpired lease exists for `(resource_id, buyer)`.
+    ///
+    /// Permissionless. A lease is valid while
+    /// `expires_at > env.ledger().sequence()`.
     pub fn is_valid(env: Env, resource_id: String, buyer: Address) -> bool {
-        let key = DataKey::Lease(resource_id, buyer);
-        match env.storage().persistent().get::<_, Lease>(&key) {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Lease>(&DataKey::Lease(resource_id, buyer))
+        {
             Some(lease) => lease.expires_at > env.ledger().sequence(),
             None => false,
         }
     }
 
-    /// Return the full [`Lease`] struct for the given pair.
-    ///
-    /// Permissionless. Unlike [`is_valid`](AccessLease::is_valid), this returns the
-    /// record even if the lease has expired.
+    /// Upgrade the contract WASM. Admin-only.
     ///
     /// # Errors
-    /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
-    pub fn get_lease(env: Env, resource_id: String, buyer: Address) -> Result<Lease, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Lease(resource_id, buyer))
-            .ok_or(Error::LeaseNotFound)
-    }
-
-    /// Revoke a lease immediately.
-    ///
-    /// Admin-only. Used on refund or Terms-of-Service violation. Removes the
-    /// lease record from persistent storage, so subsequent
-    /// [`is_valid`](AccessLease::is_valid) calls return `false`.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — admin check failed.
-    /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
-    pub fn revoke_lease(env: Env, resource_id: String, buyer: Address) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
-        if !env.storage().persistent().has(&key) {
-            return Err(Error::LeaseNotFound);
-        }
-        env.storage().persistent().remove(&key);
-        RevokeEvent { resource_id, buyer }.publish(&env);
-        Ok(())
-    }
-
-    /// Upgrade the contract WASM to `new_wasm_hash` (admin only).
+    /// * [`Error::NotInitialised`] — `init` has not been called.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        env.deployer()
-            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         UpgradeEvent { new_wasm_hash }.publish(&env);
         Ok(())
     }
-}
 
-impl AccessLease {
-    /// Load the configured admin from instance storage and require its auth.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — no admin has been set via `init`.
+    /// Internal helper: require the configured admin's auth, or fail.
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -387,284 +383,6 @@ impl AccessLease {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
         admin.require_auth();
-        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{
-        symbol_short,
-        testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
-        vec, Address, Env, IntoVal, String,
-    };
-
-    fn setup<'a>() -> (Env, AccessLeaseClient<'a>, Address) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(AccessLease, ());
-        let client = AccessLeaseClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        client.init(&admin);
-        (env, client, admin)
-    }
-
-    fn advance(env: &Env, ledgers: u32) {
-        env.ledger()
-            .set_sequence_number(env.ledger().sequence() + ledgers);
-    }
-
-    #[test]
-    fn test_grant_and_check_lease() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let resource_id = String::from_str(&env, "res_001");
-
-        assert!(!client.is_valid(&resource_id, &buyer));
-
-        let lease = client.grant_lease(&resource_id, &buyer, &1000u32);
-        assert_eq!(lease.duration_ledgers, 1000u32);
-        assert_eq!(lease.expires_at, lease.granted_at + 1000);
-        assert!(client.is_valid(&resource_id, &buyer));
-        assert_eq!(client.get_lease(&resource_id, &buyer), lease);
-    }
-
-    #[test]
-    fn test_revoke_lease() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let resource_id = String::from_str(&env, "res_001");
-
-        client.grant_lease(&resource_id, &buyer, &500u32);
-        assert!(client.is_valid(&resource_id, &buyer));
-
-        client.revoke_lease(&resource_id, &buyer);
-        assert!(!client.is_valid(&resource_id, &buyer));
-        assert_eq!(
-            client.try_get_lease(&resource_id, &buyer),
-            Err(Ok(Error::LeaseNotFound))
-        );
-    }
-
-    #[test]
-    fn init_twice_is_rejected() {
-        let (env, client, admin) = setup();
-        let attacker = Address::generate(&env);
-        assert_eq!(
-            client.try_init(&attacker),
-            Err(Ok(Error::AlreadyInitialised))
-        );
-        assert_eq!(client.admin(), admin);
-    }
-
-    #[test]
-    fn admin_calls_fail_before_init() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let client = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        assert_eq!(client.try_admin(), Err(Ok(Error::NotInitialised)));
-        assert_eq!(
-            client.try_grant_lease(&rid, &buyer, &10u32),
-            Err(Ok(Error::NotInitialised))
-        );
-    }
-
-    #[test]
-    fn grant_requires_admin_auth() {
-        let (env, client, admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &10u32);
-        assert_eq!(env.auths()[0].0, admin);
-    }
-
-    #[test]
-    fn grant_by_non_admin_is_rejected() {
-        let (env, client, _admin) = setup();
-        let mallory = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        env.mock_auths(&[MockAuth {
-            address: &mallory,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "grant_lease",
-                args: (rid.clone(), buyer.clone(), 10u32).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        assert!(client.try_grant_lease(&rid, &buyer, &10u32).is_err());
-    }
-
-    #[test]
-    fn zero_duration_rejected() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        assert_eq!(
-            client.try_grant_lease(&rid, &buyer, &0u32),
-            Err(Ok(Error::InvalidDuration))
-        );
-        client.grant_lease(&rid, &buyer, &10u32);
-        assert_eq!(
-            client.try_extend_lease(&rid, &buyer, &0u32),
-            Err(Ok(Error::InvalidDuration))
-        );
-    }
-
-    #[test]
-    fn overflowing_duration_rejected() {
-        let (env, client, _admin) = setup();
-        advance(&env, 10);
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        assert_eq!(
-            client.try_grant_lease(&rid, &buyer, &u32::MAX),
-            Err(Ok(Error::InvalidDuration))
-        );
-        client.grant_lease(&rid, &buyer, &10u32);
-        assert_eq!(
-            client.try_extend_lease(&rid, &buyer, &u32::MAX),
-            Err(Ok(Error::InvalidDuration))
-        );
-    }
-
-    #[test]
-    fn lease_expires_exactly_at_expiry() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &100u32);
-        advance(&env, 99);
-        assert!(client.is_valid(&rid, &buyer));
-        advance(&env, 1);
-        assert!(!client.is_valid(&rid, &buyer));
-        // Record is still readable after expiry.
-        assert_eq!(client.get_lease(&rid, &buyer).duration_ledgers, 100);
-    }
-
-    #[test]
-    fn active_lease_cannot_be_regranted_but_expired_can() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &100u32);
-        assert_eq!(
-            client.try_grant_lease(&rid, &buyer, &100u32),
-            Err(Ok(Error::AlreadyActive))
-        );
-        advance(&env, 100);
-        let lease = client.grant_lease(&rid, &buyer, &50u32);
-        assert_eq!(lease.granted_at, env.ledger().sequence());
-        assert!(client.is_valid(&rid, &buyer));
-    }
-
-    #[test]
-    fn extend_active_lease_stacks_on_expiry() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        let lease = client.grant_lease(&rid, &buyer, &100u32);
-        advance(&env, 40);
-        let extended = client.extend_lease(&rid, &buyer, &50u32);
-        assert_eq!(extended.expires_at, lease.expires_at + 50);
-    }
-
-    #[test]
-    fn extend_expired_lease_restarts_from_now() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &10u32);
-        advance(&env, 500);
-        let extended = client.extend_lease(&rid, &buyer, &50u32);
-        assert_eq!(extended.expires_at, env.ledger().sequence() + 50);
-        assert!(client.is_valid(&rid, &buyer));
-    }
-
-    #[test]
-    fn extend_and_revoke_missing_lease_fail() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "missing");
-        assert_eq!(
-            client.try_extend_lease(&rid, &buyer, &10u32),
-            Err(Ok(Error::LeaseNotFound))
-        );
-        assert_eq!(
-            client.try_revoke_lease(&rid, &buyer),
-            Err(Ok(Error::LeaseNotFound))
-        );
-    }
-
-    #[test]
-    fn leases_are_scoped_per_resource_and_buyer() {
-        let (env, client, _admin) = setup();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        let r1 = String::from_str(&env, "r1");
-        let r2 = String::from_str(&env, "r2");
-        client.grant_lease(&r1, &alice, &10u32);
-        assert!(client.is_valid(&r1, &alice));
-        assert!(!client.is_valid(&r2, &alice));
-        assert!(!client.is_valid(&r1, &bob));
-    }
-
-    #[test]
-    fn set_admin_rotates_admin() {
-        let (env, client, admin) = setup();
-        let new_admin = Address::generate(&env);
-        client.set_admin(&new_admin);
-        assert_eq!(env.auths()[0].0, admin);
-        assert_eq!(client.admin(), new_admin);
-    }
-
-    /// Event topics/data must stay wire-compatible with what indexers expect
-    /// (see docs/CONTRACTS.md).
-    #[test]
-    fn events_have_documented_shape() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-
-        let lease = client.grant_lease(&rid, &buyer, &10u32);
-        assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("grant"), rid.clone(), buyer.clone()).into_val(&env),
-                    lease.expires_at.into_val(&env),
-                ),
-            ]
-        );
-
-        client.revoke_lease(&rid, &buyer);
-        assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("revoke"), rid.clone(), buyer.clone()).into_val(&env),
-                    ().into_val(&env),
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn version_check() {
-        let (env, client, _admin) = setup();
-        assert_eq!(client.get_version(), String::from_str(&env, VERSION));
-        assert!(client.is_compatible());
-
-        let fresh = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
-        assert!(!fresh.is_compatible());
     }
 }

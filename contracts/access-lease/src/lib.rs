@@ -14,6 +14,12 @@ const DAY: u32 = 17_280; // ~5s/ledger × 17280 = 1 day
 const BUMP: u32 = 90 * DAY;
 const BUMP_THRESH: u32 = BUMP - DAY;
 
+/// Maximum accepted length (in bytes) of a `resource_id`.
+///
+/// Bounds the size of the persistent-storage key and the emitted event topics
+/// so a caller cannot store or emit an unbounded identifier.
+pub const MAX_RESOURCE_ID_LEN: u32 = 64;
+
 /// Contract version, sourced from Cargo.toml at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -66,10 +72,12 @@ pub enum Error {
     InvalidDuration = 4,
     /// `init` has not been called, so no admin is configured.
     NotInitialised = 5,
-    /// Reserved; kept so existing error codes stay stable.
-    UpgradeNotAllowed = 6,
     /// `init` has already been called; the admin cannot be overwritten.
     AlreadyInitialised = 7,
+    /// The lease has already expired; there is nothing to revoke.
+    LeaseExpired = 8,
+    /// `resource_id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`] bytes.
+    InvalidResourceId = 9,
 }
 
 /// Emitted by [`AccessLease::init`]. Topics: `("init",)`; data: admin.
@@ -206,106 +214,9 @@ impl AccessLease {
     /// Admin-only: the configured admin must have authorised the call.
     ///
     /// # Parameters
-    /// * `resource_id` — identifier of the resource being leased.
-    /// * `buyer` — wallet receiving access.
-    /// * `duration_ledgers` — lease length in ledgers; must be non-zero.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — `init` has not been called.
-    /// * [`Error::InvalidDuration`] — `duration_ledgers == 0`, or the expiry
-    ///   would overflow `u32`.
-    /// * [`Error::AlreadyActive`] — an unexpired lease already exists for the
-    ///   `(resource_id, buyer)` pair.
-    ///
-    /// # Invariants
-    /// On success, `expires_at == granted_at + duration_ledgers`, the lease is
-    /// written to persistent storage, and its TTL is bumped to `BUMP`.
-    /// Expired leases may be replaced by a new grant.
-    pub fn grant_lease(
-        env: Env,
-        resource_id: String,
-        buyer: Address,
-        duration_ledgers: u32,
-    ) -> Result<Lease, Error> {
-        Self::require_admin(&env)?;
+    /// * `resource_id` — identifier of the resource being leased. Must be
 
-        if duration_ledgers == 0 {
-            return Err(Error::InvalidDuration);
-        }
-
-        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
-        let now = env.ledger().sequence();
-
-        // Reject if an active (not yet expired) lease exists.
-        if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
-            if existing.expires_at > now {
-                return Err(Error::AlreadyActive);
-            }
-        }
-
-        let expires_at = now
-            .checked_add(duration_ledgers)
-            .ok_or(Error::InvalidDuration)?;
-        let lease = Lease {
-            resource_id: resource_id.clone(),
-            buyer: buyer.clone(),
-            granted_at: now,
-            expires_at,
-            duration_ledgers,
-        };
-
-        env.storage().persistent().set(&key, &lease);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
-        GrantEvent {
-            resource_id,
-            buyer,
-            expires_at,
-        }
-        .publish(&env);
-        Ok(lease)
-    }
-
-    /// Extend an existing lease by `extra_ledgers`.
-    ///
-    /// Admin-only. Works on both active and expired leases: the new expiry is
-    /// computed from `max(existing.expires_at, current_ledger)` so that an
-    /// expired lease restarts from the current ledger rather than from its
-    /// stale expiry.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — admin check failed.
-    /// * [`Error::InvalidDuration`] — `extra_ledgers == 0`, or the expiry
-    ///   would overflow `u32`.
-    /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
-    ///
-    /// # Invariants
-    /// On success, `expires_at == max(old_expires_at, now) + extra_ledgers`
-    /// and the persistent TTL is bumped to `BUMP`.
-    pub fn extend_lease(
-        env: Env,
-        resource_id: String,
-        buyer: Address,
-        extra_ledgers: u32,
-    ) -> Result<Lease, Error> {
-        Self::require_admin(&env)?;
-        if extra_ledgers == 0 {
-            return Err(Error::InvalidDuration);
-        }
-        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
-        let mut lease: Lease = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::LeaseNotFound)?;
-
-        // Extend from end of current period, or from now if already expired.
-        let base = lease.expires_at.max(env.ledger().sequence());
-        lease.expires_at = base
-            .checked_add(extra_ledgers)
-            .ok_or(Error::InvalidDuration)?;
-
+/* … truncated 609 chars — edit only what you need near the top … */
         env.storage().persistent().set(&key, &lease);
         env.storage()
             .persistent()

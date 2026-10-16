@@ -25,6 +25,7 @@ storage or error codes must update this file in the same pull request.
 | Versioning | `get_version()` returns the version recorded at `init` (crate version); `is_compatible(...)` detects stale deployments. |
 | Errors | Every fallible entrypoint returns `Result<_, Error>`; codes are stable and never renumbered. |
 | Events | Defined as `#[contractevent]` types (so they appear in the contract spec and generated bindings). Topics start with a fixed symbol; data is a single value. Unit tests (`events_have_documented_shape`) pin the wire format. |
+| Cross-contract calls | Contracts in this workspace are **independent**: none of them performs a cross-contract call to another SynapsVault contract. Each contract validates only its own inputs and trusts the admin/backend to supply consistent identifiers. See [Cross-contract trust model](#cross-contract-trust-model). |
 
 ### Roles
 
@@ -36,6 +37,31 @@ storage or error codes must update this file in the same pull request.
 | **Buyer / Subscriber** | Holds leases/subscriptions; a subscriber can cancel their own subscription. |
 | **Anyone** | All read-only entrypoints (`get`, `list`, `is_valid`, `is_active`, …) are permissionless. |
 
+### Cross-contract trust model
+
+SynapsVault contracts are deployed and operated as a set but are **not wired
+together on-chain**. In particular, `access-lease` does **not** call
+`vault-registry` to verify that a `resource_id` exists before granting a lease.
+
+This is a deliberate decision, not an oversight:
+
+- **Trusted admin.** `grant_lease` / `extend_lease` are admin-only. The admin is
+  the backend platform wallet, which is the same actor that registers resources
+  in `vault-registry`. It is expected to only grant leases for resources it has
+  registered.
+- **No coupling / no upgrade hazard.** A cross-contract call would hard-code the
+  `vault-registry` contract id into `access-lease`, coupling their deployments
+  and upgrade paths, and would add a re-entrancy / failure surface for a check
+  that the trusted caller already guarantees.
+- **Cheap off-chain verification.** Any party can independently confirm a
+  resource exists via the permissionless `vault-registry::exists(id)` read, so
+  the invariant is verifiable without an on-chain check.
+
+Consequence: a lease may reference a `resource_id` that is not (or no longer)
+registered. Consumers should treat `access-lease` as the authority on *lease*
+existence and `vault-registry` as the authority on *resource* existence, and
+check both when both matter.
+
 ---
 
 ## vault-registry
@@ -43,7 +69,7 @@ storage or error codes must update this file in the same pull request.
 On-chain registry of vault resources: creator, price, metadata pointer, tags
 and listing status. Payment itself happens off-contract (x402 + USDC SAC); the
 registry is the transparent source of truth for *what* exists, *who* owns it
-and *what it costs*.
+and *what* it costs.
 
 ### Data
 
@@ -167,6 +193,8 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 
 - `grant_lease` rejects a zero duration and any duration whose expiry would
   overflow `u32`. An expired lease may be replaced by a new grant.
+- `grant_lease` does **not** verify that `resource_id` exists in
+  `vault-registry`; see [Cross-contract trust model](#cross-contract-trust-model).
 - `extend_lease` computes `max(expires_at, now) + extra_ledgers`, so an expired
   lease restarts from the current ledger. Zero / overflowing extensions are rejected.
 - `revoke_lease` deletes the record.

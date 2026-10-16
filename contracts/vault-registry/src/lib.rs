@@ -33,6 +33,9 @@ pub const MAX_TAG_LEN: u32 = 32;
 
 /// Maximum page size returned by [`VaultRegistry::list`].
 pub const MAX_PAGE_SIZE: u32 = 20;
+/// Maximum byte length of a resource id. Ids must be non-empty and no longer
+/// than this; violations are rejected with [`Error::InvalidResourceId`].
+pub const MAX_RESOURCE_ID_LEN: u32 = 64;
 /// Contract version, sourced from the crate manifest at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -79,6 +82,10 @@ pub enum DataKey {
     Admin,
     /// Contract version recorded at `init` (instance storage).
     Version,
+    /// Pending new owner proposed by the current creator for a two-step
+    /// ownership transfer. Cleared on [`VaultRegistry::accept_transfer`] or
+    /// [`VaultRegistry::cancel_transfer`].
+    PendingOwner(String),
 }
 
 /// Errors returned by registry operations.
@@ -105,6 +112,12 @@ pub enum Error {
     AlreadyInitialised = 8,
     /// Metadata pointer must not be empty.
     MetadataEmpty = 9,
+    /// Resource id is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
+    InvalidResourceId = 10,
+    /// No pending ownership transfer exists for this resource id.
+    NoPendingTransfer = 11,
+    /// Only the proposed new owner may accept the transfer.
+    NotPendingOwner = 12,
 }
 
 /// Emitted by `init`. Topics: `("init",)`; data: admin.
@@ -160,13 +173,30 @@ pub struct SetTagsEvent {
     pub tags: Vec<String>,
 }
 
-/// Emitted by `transfer_ownership`. Topics: `("transfer", id)`; data: new creator.
+/// Emitted by `propose_transfer`. Topics: `("proptrans", id)`; data: proposed new creator.
+#[contractevent(topics = ["proptrans"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposeTransferEvent {
+    #[topic]
+    pub id: String,
+    pub proposed_creator: Address,
+}
+
+/// Emitted by `accept_transfer`. Topics: `("transfer", id)`; data: new creator.
 #[contractevent(topics = ["transfer"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferEvent {
     #[topic]
     pub id: String,
     pub new_creator: Address,
+}
+
+/// Emitted by `cancel_transfer`. Topics: `("canceltrans", id)`; no data.
+#[contractevent(topics = ["canceltrans"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelTransferEvent {
+    #[topic]
+    pub id: String,
 }
 
 /// Emitted by `set_listed`. Topics: `("setlisted", id)`; data: listed flag.
@@ -252,6 +282,7 @@ impl VaultRegistry {
         tags: Vec<String>,
     ) -> Result<(), Error> {
         creator.require_auth();
+        Self::validate_resource_id(&id)?;
         if price <= 0 {
             return Err(Error::InvalidPrice);
         }
@@ -289,13 +320,15 @@ impl VaultRegistry {
     /// Only the creator may call this (enforced via `require_auth`).
     ///
     /// # Errors
-    /// - [`Error::InvalidPrice`] if `new_price <= 0`.
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
+    /// - [`Error::InvalidPrice`] if `new_price <= 0`.
     pub fn set_price(env: Env, id: String, new_price: i128) -> Result<(), Error> {
+        Self::validate_resource_id(&id)?;
+        let mut resource = Self::load(&env, &id)?;
         if new_price <= 0 {
             return Err(Error::InvalidPrice);
         }
-        let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
         resource.price = new_price;
         Self::save(&env, &resource);
@@ -312,11 +345,13 @@ impl VaultRegistry {
     /// Only the creator may call this (enforced via `require_auth`).
     ///
     /// # Errors
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
     /// - [`Error::MetadataEmpty`] if `metadata` is an empty string.
     /// - [`Error::MetadataTooLong`] if `metadata` exceeds
     ///   [`MAX_METADATA_POINTER_LEN`].
     pub fn update_metadata(env: Env, id: String, metadata: String) -> Result<(), Error> {
+        Self::validate_resource_id(&id)?;
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
         Self::validate_metadata_pointer(&metadata)?;
@@ -334,13 +369,15 @@ impl VaultRegistry {
     /// rejected.
     ///
     /// # Errors
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
+    /// - [`Error::NotFound`] if no resource exists with `id`.
     /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`], any tag is empty
     ///   or exceeds [`MAX_TAG_LEN`], or duplicate tags are supplied (after
     ///   case-normalisation).
-    /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn set_tags(env: Env, id: String, tags: Vec<String>) -> Result<(), Error> {
-        let normalised_tags = Self::validate_and_normalise_tags(&env, &tags)?;
+        Self::validate_resource_id(&id)?;
         let mut resource = Self::load(&env, &id)?;
+        let normalised_tags = Self::validate_and_normalise_tags(&env, &tags)?;
         resource.creator.require_auth();
         resource.tags = normalised_tags.clone();
         Self::save(&env, &resource);
@@ -348,19 +385,93 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Hand ownership to a new creator.
+    /// Propose a two-step ownership transfer to `new_creator`.
     ///
-    /// Only the current creator may call this (enforced via `require_auth`).
-    /// The registry `Count` is not affected by transfers.
+    /// Step 1 of 2: the current creator proposes a new owner. This stores a
+    /// pending proposal on-chain but does **not** transfer ownership yet.
+    /// The proposed new creator must call [`accept_transfer`](VaultRegistry::accept_transfer)
+    /// to complete the transfer. The current creator may call
+    /// [`cancel_transfer`](VaultRegistry::cancel_transfer) to abort.
+    ///
+    /// If `new_creator` is already the current creator the call returns early
+    /// with no write and no event (no-op).
     ///
     /// # Errors
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
-    pub fn transfer_ownership(env: Env, id: String, new_creator: Address) -> Result<(), Error> {
-        let mut resource = Self::load(&env, &id)?;
+    pub fn propose_transfer(env: Env, id: String, new_creator: Address) -> Result<(), Error> {
+        Self::validate_resource_id(&id)?;
+        let resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
+        // #78: no-op when proposed owner is already the current creator.
+        if resource.creator == new_creator {
+            return Ok(());
+        }
+        let key = DataKey::PendingOwner(id.clone());
+        env.storage().persistent().set(&key, &new_creator);
+        Self::bump_persistent(&env, &key);
+        ProposeTransferEvent {
+            id,
+            proposed_creator: new_creator,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Accept a pending ownership transfer.
+    ///
+    /// Step 2 of 2: the proposed new owner accepts and becomes the creator.
+    /// The pending proposal is removed; the resource's `creator` field is
+    /// updated atomically.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
+    /// - [`Error::NotFound`] if no resource exists with `id`.
+    /// - [`Error::NoPendingTransfer`] if no proposal exists for `id`.
+    /// - [`Error::NotPendingOwner`] if the caller is not the proposed new owner.
+    pub fn accept_transfer(env: Env, id: String, new_creator: Address) -> Result<(), Error> {
+        Self::validate_resource_id(&id)?;
+        let mut resource = Self::load(&env, &id)?;
+        let pending_key = DataKey::PendingOwner(id.clone());
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(Error::NoPendingTransfer)?;
+        if pending != new_creator {
+            return Err(Error::NotPendingOwner);
+        }
+        new_creator.require_auth();
+        env.storage().persistent().remove(&pending_key);
         resource.creator = new_creator.clone();
         Self::save(&env, &resource);
-        TransferEvent { id, new_creator }.publish(&env);
+        TransferEvent {
+            id,
+            new_creator,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Cancel a pending ownership transfer.
+    ///
+    /// Only the current creator may cancel. Removes the pending proposal
+    /// without transferring ownership. If no proposal exists the call is a
+    /// no-op (no write, no event).
+    ///
+    /// # Errors
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
+    /// - [`Error::NotFound`] if no resource exists with `id`.
+    pub fn cancel_transfer(env: Env, id: String) -> Result<(), Error> {
+        Self::validate_resource_id(&id)?;
+        let resource = Self::load(&env, &id)?;
+        resource.creator.require_auth();
+        let pending_key = DataKey::PendingOwner(id.clone());
+        if !env.storage().persistent().has(&pending_key) {
+            return Ok(());
+        }
+        env.storage().persistent().remove(&pending_key);
+        CancelTransferEvent { id }.publish(&env);
         Ok(())
     }
 
@@ -371,8 +482,10 @@ impl VaultRegistry {
     /// (no storage write, no event emitted).
     ///
     /// # Errors
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn set_listed(env: Env, id: String, listed: bool) -> Result<(), Error> {
+        Self::validate_resource_id(&id)?;
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
         if resource.listed == listed {
@@ -516,6 +629,16 @@ impl VaultRegistry {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
         admin.require_auth();
+        Ok(())
+    }
+
+    /// Validate a resource id: must be non-empty and no longer than
+    /// [`MAX_RESOURCE_ID_LEN`] bytes.
+    fn validate_resource_id(id: &String) -> Result<(), Error> {
+        let len = id.len();
+        if len == 0 || len > MAX_RESOURCE_ID_LEN {
+            return Err(Error::InvalidResourceId);
+        }
         Ok(())
     }
 

@@ -86,6 +86,7 @@ pub struct Resource {
 
 | Constant | Value |
 |---|---|
+| `MAX_RESOURCE_ID_LEN` | 64 bytes |
 | `MAX_METADATA_POINTER_LEN` | 512 bytes |
 | `MAX_TAGS` | 8 |
 | `MAX_TAG_LEN` | 32 bytes |
@@ -98,13 +99,15 @@ pub struct Resource {
 | `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
 | `admin()` | — | `Address` | `NotInitialised` |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
-| `register(creator, id, price, metadata, tags)` | `creator` | `()` | `InvalidPrice`, `MetadataTooLong`, `InvalidTag`, `AlreadyRegistered` |
-| `set_price(id, new_price)` | Creator | `()` | `InvalidPrice`, `NotFound` |
-| `update_metadata(id, metadata)` | Creator | `()` | `NotFound`, `MetadataTooLong` |
-| `set_tags(id, tags)` | Creator | `()` | `InvalidTag`, `NotFound` |
-| `transfer_ownership(id, new_creator)` | Creator | `()` | `NotFound` |
-| `set_listed(id, listed)` | Creator | `()` | `NotFound` |
-| `delist(id)` | Creator | `()` | `NotFound` |
+| `register(creator, id, price, metadata, tags)` | `creator` | `()` | `InvalidResourceId`, `InvalidPrice`, `MetadataTooLong`, `MetadataEmpty`, `InvalidTag`, `AlreadyRegistered` |
+| `set_price(id, new_price)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `InvalidPrice` |
+| `update_metadata(id, metadata)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `MetadataEmpty`, `MetadataTooLong` |
+| `set_tags(id, tags)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `InvalidTag` |
+| `propose_transfer(id, new_creator)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
+| `accept_transfer(id, new_creator)` | `new_creator` | `()` | `InvalidResourceId`, `NotFound`, `NoPendingTransfer`, `NotPendingOwner` |
+| `cancel_transfer(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
+| `set_listed(id, listed)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
+| `delist(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `list(start, limit)` | — | `Vec<Resource>` | — (`limit` capped at 20) |
 | `get(id)` | — | `Resource` | `NotFound` |
 | `exists(id)` | — | `bool` | — |
@@ -116,12 +119,26 @@ pub struct Resource {
 
 The registry itself works without `init`; the admin is only needed for `upgrade`.
 
+**Ownership transfer (two-step)**
+
+Ownership transfer is a two-step flow to prevent permanently locking a resource
+with a mistyped address (fixes #77):
+
+1. **`propose_transfer(id, new_creator)`** — current creator proposes a new owner.
+   Stores a `PendingOwner` entry. No-op if `new_creator` is already the current
+   creator (fixes #78).
+2. **`accept_transfer(id, new_creator)`** — proposed new owner accepts, takes
+   ownership, and the pending entry is removed.
+3. **`cancel_transfer(id)`** — current creator cancels, removes the pending entry.
+   No-op if no proposal is pending.
+
 ### Storage
 
 | Key | Storage | Value | TTL |
 |---|---|---|---|
 | `Resource(id)` | persistent | `Resource` | bumped to 30 days on every write |
 | `Index(i)` | persistent | resource id (insertion order) | bumped to 30 days on write |
+| `PendingOwner(id)` | persistent | `Address` (proposed new owner) | bumped to 30 days on write |
 | `Count` | instance | `u32`, monotonic | instance bumped on write |
 | `Admin` | instance | `Address` | — |
 | `Version` | instance | `String` | — |
@@ -133,9 +150,11 @@ The registry itself works without `init`; the admin is only needed for `upgrade`
 | `("init",)` | admin |
 | `("register", creator)` | id |
 | `("setprice", id)` | new price |
-| `("updmeta", id)` | `()` |
+| `("updmeta", id)` | new metadata pointer |
 | `("settags", id)` | tags |
-| `("transfer", id)` | new creator |
+| `("proptrans", id)` | proposed new creator |
+| `("transfer", id)` | new creator (on `accept_transfer`) |
+| `("canceltrans", id)` | `()` |
 | `("setlisted", id)` | listed |
 | `("upgrade",)` | new wasm hash |
 
@@ -147,10 +166,14 @@ The registry itself works without `init`; the admin is only needed for `upgrade`
 | 2 | `NotFound` | No resource with `id`. |
 | 3 | `InvalidPrice` | Price ≤ 0. |
 | 4 | `MetadataTooLong` | Metadata > 512 bytes. |
-| 5 | `InvalidTag` | > 8 tags, or a tag is empty / > 32 bytes. |
+| 5 | `InvalidTag` | > 8 tags, or a tag is empty / > 32 bytes / duplicate. |
 | 6 | `NotAdmin` | Reserved. |
 | 7 | `NotInitialised` | Admin-only call before `init`. |
 | 8 | `AlreadyInitialised` | `init` called twice. |
+| 9 | `MetadataEmpty` | Metadata pointer is an empty string. |
+| 10 | `InvalidResourceId` | Resource id is empty or > 64 bytes. |
+| 11 | `NoPendingTransfer` | `accept_transfer` called with no pending proposal. |
+| 12 | `NotPendingOwner` | Caller is not the proposed new owner. |
 
 ---
 

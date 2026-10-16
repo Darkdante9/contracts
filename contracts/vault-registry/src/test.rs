@@ -1048,3 +1048,171 @@ proptest! {
         assert_eq!(r4.listed, listed);
     }
 }
+
+// ── #80: UpdateMetadataEvent must carry the new metadata pointer ─────────────
+
+/// Verify that `update_metadata` emits an event whose data field contains the
+/// new metadata pointer so that indexers do not need an extra ledger read.
+#[test]
+fn update_metadata_event_includes_new_pointer() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "ev-meta");
+    let old_meta = String::from_str(&env, "ipfs://QmOld");
+    let new_meta = String::from_str(&env, "ipfs://QmNew");
+
+    client.register(&creator, &id, &100i128, &old_meta, &empty_tags(&env));
+    env.events().all(); // clear previous events
+
+    client.update_metadata(&id, &new_meta);
+
+    let all = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(all.len(), 1);
+    // data value must be the new metadata string, not unit / empty
+    let (_contract, _topics, data) = all.get(0).unwrap();
+    let emitted: String = data.into_val(&env);
+    assert_eq!(emitted, new_meta);
+}
+
+// ── #81: set_listed must be a no-op when value is unchanged ──────────────────
+
+/// Calling `set_listed` with the current value must not write to storage
+/// (TTL is unchanged) and must not emit any event.
+#[test]
+fn set_listed_no_op_when_value_unchanged() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "noop-listed");
+    client.register(
+        &creator,
+        &id,
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+
+    // Resource is listed by default; call set_listed(true) — should be no-op.
+    let ttl_before = resource_storage_ttl(&env, &client.address, &id);
+    env.events().all(); // clear
+
+    client.set_listed(&id, &true);
+
+    // No events emitted.
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(events.len(), 0, "expected no event on no-op set_listed");
+
+    // TTL must not have been bumped (no storage write happened).
+    let ttl_after = resource_storage_ttl(&env, &client.address, &id);
+    assert_eq!(ttl_before, ttl_after, "TTL must not change on no-op set_listed");
+}
+
+/// Calling `set_listed` with a different value must still emit the event.
+#[test]
+fn set_listed_emits_event_when_value_changes() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "change-listed");
+    client.register(
+        &creator,
+        &id,
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+    env.events().all(); // clear
+
+    client.set_listed(&id, &false);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(events.len(), 1, "expected one event when listed changes");
+    let (_contract, _topics, data) = events.get(0).unwrap();
+    let emitted: bool = data.into_val(&env);
+    assert!(!emitted);
+}
+
+// ── #83: is_compatible must reject malformed / boundary version strings ───────
+
+/// Versions with only one dot (no patch component) must return false.
+#[test]
+fn is_compatible_rejects_version_without_patch() {
+    let (env, _creator, client) = setup();
+    // "0.1" has no patch — must not match "0.1.x"
+    assert!(
+        !client.is_compatible(&String::from_str(&env, "0.1")),
+        "two-component version must not be compatible"
+    );
+    assert!(
+        !client.is_compatible(&String::from_str(&env, "1.0")),
+        "two-component version must not be compatible"
+    );
+}
+
+/// Completely malformed strings must return false.
+#[test]
+fn is_compatible_rejects_malformed_versions() {
+    let (env, _creator, client) = setup();
+    let bad = ["", "abc", ".", "..", "1", "1.", ".0.1", "0..1", "0.1.", "0.1.2.3"];
+    for v in &bad {
+        assert!(
+            !client.is_compatible(&String::from_str(&env, v)),
+            "expected false for malformed version {:?}",
+            v
+        );
+    }
+}
+
+/// A well-formed version with matching major.minor but differing patch is
+/// still compatible (patch is not part of the compatibility check).
+#[test]
+fn is_compatible_accepts_different_patch() {
+    let (env, _creator, client) = setup();
+    // VERSION is the compile-time crate version; craft a variant with a
+    // different patch number to ensure patch is ignored.
+    let compatible_alt = String::from_str(&env, "0.1.99");
+    // This only holds if VERSION is 0.1.x — adapt if the crate version changes.
+    // We use a known-compatible full version first as a sanity check.
+    assert!(
+        client.is_compatible(&String::from_str(&env, VERSION)),
+        "current VERSION must be compatible with itself"
+    );
+    // A higher patch on the same major.minor is also compatible.
+    let _ = compatible_alt; // used conditionally below
+    // Build a version string with the same major.minor as VERSION but patch=99.
+    let version_bytes = VERSION.as_bytes();
+    let mut dots = 0usize;
+    let mut second_dot = version_bytes.len();
+    for (i, b) in version_bytes.iter().enumerate() {
+        if *b == b'.' {
+            dots += 1;
+            if dots == 2 {
+                second_dot = i;
+                break;
+            }
+        }
+    }
+    let prefix = &VERSION[..second_dot];
+    let alt = std::format!("{}.99", prefix);
+    assert!(
+        client.is_compatible(&String::from_str(&env, &alt)),
+        "same major.minor with different patch must be compatible"
+    );
+}
+
+/// Boundary: version string at exactly 32 bytes is accepted if well-formed;
+/// 33+ bytes is rejected by the length guard.
+#[test]
+fn is_compatible_length_boundary() {
+    let (env, _creator, client) = setup();
+    // 33-character version — must be rejected by the len > BUF_LEN guard.
+    let long = "1".repeat(11) + "." + &"2".repeat(11) + "." + &"3".repeat(8); // 33 chars
+    assert_eq!(long.len(), 33);
+    assert!(
+        !client.is_compatible(&String::from_str(&env, &long)),
+        "version longer than 32 bytes must be rejected"
+    );
+
+    // A well-formed 32-byte version string should parse without panicking.
+    // e.g. "111.222.333444555" is 17 chars; pad the patch to hit 32 chars.
+    let at_limit = "1.1.".to_string() + &"0".repeat(28); // 32 chars
+    assert_eq!(at_limit.len(), 32);
+    // We don't assert true/false here (major.minor won't match VERSION in
+    // general) but we do assert it doesn't panic and returns a bool.
+    let _ = client.is_compatible(&String::from_str(&env, &at_limit));
+}

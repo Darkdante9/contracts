@@ -222,9 +222,119 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `NotAdmin` | Reserved. |
+| 1 | `NotAdmin` | Reserved. Never returned: admin-gated entrypoints call `admin.require_auth()`, so a failed authorisation traps (panics) instead of returning this code. |
 | 2 | `LeaseNotFound` | No lease for the pair. |
+| 3 | `AlreadyActive` | 
 | 3 | `AlreadyActive` | A non-expired lease already exists for the pair. |
 | 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. |
 | 5 | `NotInitialised` | Admin-only call before `init`. |
 | 6 | `AlreadyInitialised` | `init` called twice. |
+
+---
+
+## subscription
+
+Recurring access plans. A publisher creates a `Plan`; the admin subscribes a
+buyer to it, and the buyer can cancel. Payment happens off-contract (x402 +
+USDC SAC); the contract records the entitlement window.
+
+### Data
+
+```rust
+pub struct Plan {
+    pub id: String,          // unique, immutable
+    pub publisher: Address,  // only address allowed to mutate the plan
+    pub price: i128,         // USDC stroops, > 0
+    pub period_ledgers: u32, // billing period, > 0
+    pub active: bool,        // true on create
+}
+
+pub struct Subscription {
+    pub plan_id: String,
+    pub subscriber: Address,
+    pub started_at: u32,     // ledger of first subscribe
+    pub expires_at: u32,     // exclusive
+    pub period_ledgers: u32, // period as of the last subscribe/renew
+}
+```
+
+A subscription is **active** iff it exists and `expires_at > ledger.sequence()`.
+
+### Functions
+
+| Function | Auth | Returns | Errors |
+|---|---|---|---|
+| `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
+| `admin()` | — | `Address` | `NotInitialised` |
+| `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
+| `create_plan(publisher, id, price, period_ledgers)` | `publisher` | `()` | `InvalidPrice`, `InvalidPeriod`, `AlreadyExists` |
+| `set_plan_price(id, new_price)` | Publisher | `()` | `InvalidPrice`, `NotFound` |
+| `set_plan_active(id, active)` | Publisher | `()` | `NotFound` |
+| `transfer_plan(id, new_publisher)` | Publisher | `()` | `NotFound` |
+| `subscribe(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `NotFound`, `PlanInactive`, `AlreadySubscribed` |
+| `renew(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `NotFound`, `PlanInactive`, `NotSubscribed` |
+| `cancel(plan_id, subscriber)` | Subscriber | `()` | `NotSubscribed` |
+| `is_active(plan_id, subscriber)` | — | `bool` | — |
+| `get_subscription(plan_id, subscriber)` | — | `Subscription` (even if expired) | `NotSubscribed` |
+| `get_plan(id)` | — | `Plan` | `NotFound` |
+| `get_version()` | — | `String` | — |
+| `is_compatible()` | — | `bool` — stored version == compiled | — |
+| `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
+
+**Semantics**
+
+- `create_plan` rejects a zero price or zero period.
+- `subscribe` rejects a plan that is inactive and a subscriber that already has
+  a subscription for the plan. The new window is `now + period_ledgers`.
+- `renew` extends the subscription by `period_ledgers` from `max(expires_at, now)`:
+  - While the subscription is still active (`expires_at > now`) the new expiry is
+    `expires_at + period_ledgers`, so renewals stack without losing paid time.
+  - After a lapse (`expires_at <= now`) the new expiry is `now + period_ledgers`,
+    i.e. the window restarts from the current ledger.
+  - **Gap is unbounded.** There is no cap on how long a subscription may sit
+    expired before a renewal: a renewal after any gap (days, months, years)
+    restarts a full `period_ledgers` window from `now`. This is intentional —
+    the contract does not attempt to charge or back-fill for the lapsed period,
+    and no retroactive access is granted. Callers that need to enforce a maximum
+    grace window must do so off-contract before invoking `renew`.
+  - Zero / overflowing extensions are rejected (`InvalidPeriod`).
+- `cancel` deletes the record.
+
+### Storage
+
+| Key | Storage | Value | TTL |
+|---|---|---|---|
+| `Admin` | instance | `Address` | instance bumped to 90 days on admin calls |
+| `Version` | instance | `String` | — |
+| `Plan(id)` | persistent | `Plan` | bumped to 90 days on write |
+| `Subscription(plan_id, subscriber)` | persistent | `Subscription` | bumped to 90 days on write |
+
+### Events
+
+| Topics | Data |
+|---|---|
+| `("init",)` | admin |
+| `("setadmin",)` | new admin |
+| `("createplan", id)` | publisher |
+| `("setprice", id)` | new price |
+| `("setactive", id)` | active |
+| `("transfer", id)` | new publisher |
+| `("subscribe", plan_id, subscriber)` | `expires_at` |
+| `("renew", plan_id, subscriber)` | new `expires_at` |
+| `("cancel", plan_id, subscriber)` | `()` |
+| `("upgrade",)` | new wasm hash |
+
+### Errors
+
+| Code | Name | Meaning |
+|---|---|---|
+| 1 | `NotAdmin` | Reserved. |
+| 2 | `NotFound` | No plan with `id`. |
+| 3 | `AlreadyExists` | `id` already registered. |
+| 4 | `InvalidPrice` | Price ≤ 0. |
+| 5 | `InvalidPeriod` | Period is zero or the resulting expiry overflows `u32`. |
+| 6 | `PlanInactive` | Plan is deactivated. |
+| 7 | `AlreadySubscribed` | Subscriber already has a subscription for the plan. |
+| 8 | `NotSubscribed` | No subscription for the pair. |
+| 9 | `NotInitialised` | Admin-only call before `init`. |
+| 10 | `AlreadyInitialised` | `init` called twice. |

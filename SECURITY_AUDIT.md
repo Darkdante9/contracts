@@ -25,6 +25,7 @@ resolution is covered by a unit test in the contract's test module.
 | SV-9 | subscription | Low | `deactivate_plan` and `cancel` wrote entries without bumping their TTL, so entries could be archived. | TTL bumped on every write. | Resolved |
 | SV-10 | all | Low | access-lease and subscription emitted no events, so there was no on-chain audit trail for grants, revocations, subscriptions or upgrades. | Events on every state change and on `upgrade` (see `docs/CONTRACTS.md`). | Resolved |
 | SV-11 | access-lease, subscription | Low | Instance storage (holding the admin) was only bumped at `init` and could expire. | Instance TTL bumped on every admin-gated call. | Resolved |
+| SV-12 | access-lease | High | `init` did not require the admin's signature, so a front-runner could call `init` first after deployment and install themselves as admin, taking over every admin-only entrypoint. | `init` calls `admin.require_auth()` before writing any state, so only the intended admin can initialise the contract. Test: `init_requires_admin_auth`. | Resolved |
 
 ## 2. Access-control matrix (verified by tests)
 
@@ -33,6 +34,7 @@ resolution is covered by a unit test in the contract's test module.
 | `vault-registry::register` | `creator` | `mutations_require_creator_auth` |
 | `vault-registry::set_price` etc. | stored creator | `set_price_by_non_creator_is_rejected` |
 | `vault-registry::upgrade` | admin | `upgrade_rejects_non_admin` |
+| `access-lease::init` | admin | `init_requires_admin_auth` |
 | `access-lease::grant_lease` / `extend_lease` / `revoke_lease` | admin | `grant_by_non_admin_is_rejected` |
 | `subscription::subscribe` / `renew` | admin | `subscribe_by_non_admin_is_rejected` |
 | `subscription::deactivate_plan` | publisher | `deactivate_requires_publisher_auth` |
@@ -50,10 +52,6 @@ resolution is covered by a unit test in the contract's test module.
 
 ## 4. Residual risk
 
-- **Front-running `init`.** `init` does not require the admin's signature (the
-  deploy pipeline signs with the deployer key, not the admin key). Deploy and
-  `init` in the same pipeline run, and check `admin()` after deploying. The
-  workflows in `.github/workflows` do this.
 - **Admin key compromise.** The admin can upgrade code and grant arbitrary
   leases. Use a hardware-backed or multisig account on mainnet and rotate with
   `set_admin` if needed.

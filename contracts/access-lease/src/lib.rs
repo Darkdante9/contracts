@@ -659,6 +659,69 @@ mod tests {
     }
 
     #[test]
+    fn is_valid_false_exactly_at_expires_at_after_extend_on_expired_lease() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+
+        // Grant and let it expire.
+        client.grant_lease(&rid, &buyer, &10u32);
+        advance(&env, 500);
+        assert!(!client.is_valid(&rid, &buyer));
+
+        // Extend the expired lease by 50 ledgers — base is now (500), so expires_at = 550.
+        let extended = client.extend_lease(&rid, &buyer, &50u32);
+        let expected_expiry = env.ledger().sequence() + 50;
+        assert_eq!(extended.expires_at, expected_expiry);
+        assert!(client.is_valid(&rid, &buyer));
+
+        // One ledger before expiry: still valid.
+        advance(&env, 49);
+        assert!(client.is_valid(&rid, &buyer));
+
+        // Exactly at expires_at: no longer valid.
+        advance(&env, 1);
+        assert_eq!(env.ledger().sequence(), expected_expiry);
+        assert!(!client.is_valid(&rid, &buyer));
+    }
+
+    #[test]
+    fn grant_lease_boundary_at_u32_max() {
+        let (env, client, _admin) = setup();
+        // Position ledger so that now + duration == u32::MAX exactly.
+        let now = 100u32;
+        env.ledger().set_sequence_number(now);
+        let duration = u32::MAX - now;
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+
+        let lease = client.grant_lease(&rid, &buyer, &duration);
+        assert_eq!(lease.expires_at, u32::MAX);
+        assert_eq!(lease.granted_at, now);
+        assert_eq!(lease.duration_ledgers, duration);
+        assert!(client.is_valid(&rid, &buyer));
+    }
+
+    #[test]
+    fn revoke_then_regrant_same_ledger() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+
+        client.grant_lease(&rid, &buyer, &100u32);
+        assert!(client.is_valid(&rid, &buyer));
+
+        // Revoke and immediately re-grant without advancing the ledger.
+        client.revoke_lease(&rid, &buyer);
+        assert!(!client.is_valid(&rid, &buyer));
+
+        let lease = client.grant_lease(&rid, &buyer, &50u32);
+        assert_eq!(lease.granted_at, env.ledger().sequence());
+        assert_eq!(lease.expires_at, env.ledger().sequence() + 50);
+        assert!(client.is_valid(&rid, &buyer));
+    }
+
+    #[test]
     fn version_check() {
         let (env, client, _admin) = setup();
         assert_eq!(client.get_version(), String::from_str(&env, VERSION));

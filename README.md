@@ -28,7 +28,9 @@ Only the registered creator can mutate their resource (`require_auth`). Ownershi
 | `register(creator, id, price, metadata, tags)` | Creator | Register a resource |
 | `set_price` / `update_metadata` / `set_tags` | Creator | Mutate a resource |
 | `set_listed` / `delist` | Creator | Toggle discoverability |
-| `transfer_ownership(id, new_creator)` | Creator | Hand over ownership |
+| `propose_transfer(id, new_creator)` | Creator | Propose ownership transfer (step 1 of 2) |
+| `accept_transfer(id, new_creator)` | New creator | Accept proposed transfer (step 2 of 2) |
+| `cancel_transfer(id)` | Creator | Cancel a pending transfer |
 | `get` / `get_owner` / `exists` / `count` | None | Reads |
 | `list(start, limit)` | None | Paginated, max 20 per page |
 | `upgrade(new_wasm_hash)` | Admin | Upgrade WASM |
